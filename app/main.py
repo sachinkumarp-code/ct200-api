@@ -10,9 +10,13 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Document, Node, Version
 from app.parser import parse_pdf
+from pydantic import BaseModel
 
 app = FastAPI(title="CT-200 Manual API")
 
+
+class SectionSelectionRequest(BaseModel):
+    section_numbers: list[str]
 
 @app.get("/health")
 def health_check():
@@ -352,3 +356,82 @@ def get_section(
         },
     }
 
+
+@app.post(
+    "/documents/{document_name}/versions/{version_label}/selection"
+)
+def select_sections(
+    document_name: str,
+    version_label: str,
+    request: SectionSelectionRequest,
+    db: Session = Depends(get_db),
+):
+    """Select sections from one exact manual version."""
+    document = (
+        db.query(Document)
+        .filter(Document.name == document_name)
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    version = (
+        db.query(Version)
+        .filter(
+            Version.document_id == document.id,
+            Version.version_label == version_label,
+        )
+        .first()
+    )
+    if version is None:
+        raise HTTPException(status_code=404, detail="Version not found.")
+
+    if not request.section_numbers:
+        raise HTTPException(
+            status_code=422,
+            detail="Select at least one section.",
+        )
+
+    selected = []
+    missing = []
+
+    for number in request.section_numbers:
+        node = (
+            db.query(Node)
+            .filter(
+                Node.version_id == version.id,
+                Node.section_number == number,
+            )
+            .order_by(Node.source_order)
+            .first()
+        )
+
+        if node is None:
+            missing.append(number)
+            continue
+
+        selected.append({
+            "section_number": node.section_number,
+            "title": node.title,
+            "body": node.body,
+            "logical_id": node.logical_id,
+            "content_hash": node.content_hash,
+            "source_order": node.source_order,
+        })
+
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Some sections were not found in this version.",
+                "missing_sections": missing,
+                "version_label": version_label,
+            },
+        )
+
+    return {
+        "document_name": document.name,
+        "version_label": version.version_label,
+        "selected_count": len(selected),
+        "sections": selected,
+    }

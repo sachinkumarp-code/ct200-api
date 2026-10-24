@@ -171,3 +171,47 @@ def test_browse_documents_versions_and_sections(client):
 def test_browse_unknown_document_returns_404(client):
     response = client.get("/documents/Unknown-Manual/versions")
     assert response.status_code == 404
+
+
+def test_select_sections_from_specific_version(client):
+    pdf_path = Path(__file__).parent.parent / "data" / "ct200_manual.pdf"
+
+    with open(pdf_path, "rb") as pdf_file:
+        response = client.post(
+            "/ingest",
+            data={"document_name": "CT-200-Selection", "version_label": "v1"},
+            files={"file": ("ct200_manual.pdf", pdf_file, "application/pdf")},
+        )
+
+    assert response.status_code == 200
+
+    response = client.post(
+        "/documents/CT-200-Selection/versions/v1/selection",
+        json={"section_numbers": ["2.1", "3.2"]},
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["version_label"] == "v1"
+    assert result["selected_count"] == 2
+    assert [s["section_number"] for s in result["sections"]] == ["2.1", "3.2"]
+    assert all(s["content_hash"] for s in result["sections"])
+
+
+def test_select_missing_section_returns_422(client):
+    pdf_path = Path(__file__).parent.parent / "data" / "ct200_manual.pdf"
+
+    with open(pdf_path, "rb") as pdf_file:
+        response = client.post(
+            "/ingest",
+            data={"document_name": "CT-200-Missing", "version_label": "v1"},
+            files={"file": ("ct200_manual.pdf", pdf_file, "application/pdf")},
+        )
+
+    assert response.status_code == 200
+
+    response = client.post(
+        "/documents/CT-200-Missing/versions/v1/selection",
+        json={"section_numbers": ["99.99"]},
+    )
+    assert response.status_code == 422
