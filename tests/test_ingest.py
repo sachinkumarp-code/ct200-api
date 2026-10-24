@@ -215,3 +215,41 @@ def test_select_missing_section_returns_422(client):
         json={"section_numbers": ["99.99"]},
     )
     assert response.status_code == 422
+
+def test_compare_manual_versions(client):
+    data_dir = Path(__file__).parent.parent / "data"
+
+    for label, filename in (
+        ("v1", "ct200_manual.pdf"),
+        ("v2", "ct200_manual_v2.pdf"),
+    ):
+        with open(data_dir / filename, "rb") as pdf_file:
+            response = client.post(
+                "/ingest",
+                data={
+                    "document_name": "CT-200-Compare",
+                    "version_label": label,
+                },
+                files={
+                    "file": (filename, pdf_file, "application/pdf"),
+                },
+            )
+        assert response.status_code == 200
+
+    response = client.get(
+        "/documents/CT-200-Compare/compare/v1/v2"
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["old_version"] == "v1"
+    assert result["new_version"] == "v2"
+    assert result["change_count"] > 0
+    assert any(
+        change["status"] in ("added", "changed", "removed")
+        for change in result["changes"]
+    )
+    assert all(
+        change["severity"] in ("high", "medium")
+        for change in result["changes"]
+    )

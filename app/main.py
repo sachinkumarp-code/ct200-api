@@ -9,8 +9,9 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Document, Node, Version
-from app.parser import parse_pdf
 from pydantic import BaseModel
+import re
+from app.parser import compare_nodes, parse_pdf
 
 app = FastAPI(title="CT-200 Manual API")
 
@@ -434,4 +435,128 @@ def select_sections(
         "version_label": version.version_label,
         "selected_count": len(selected),
         "sections": selected,
+    }
+
+@app.get(
+    "/documents/{document_name}/compare/{old_version}/{new_version}"
+)
+def compare_manual_versions(
+    document_name: str,
+    old_version: str,
+    new_version: str,
+    db: Session = Depends(get_db),
+):
+    """Compare two versions and flag potentially important changes."""
+    document = (
+        db.query(Document)
+        .filter(Document.name == document_name)
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    versions = {}
+    for label in (old_version, new_version):
+        version = (
+            db.query(Version)
+            .filter(
+                Version.document_id == document.id,
+                Version.version_label == label,
+            )
+            .first()
+        )
+        if version is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Version '{label}' not found.",
+            )
+        versions[label] = version
+
+    if old_version == new_version:
+        raise HTTPException(
+            status_code=422,
+            detail="Choose two different versions to compare.",
+        )
+
+    old_nodes = (
+        db.query(Node)
+        .filter(Node.version_id == versions[old_version].id)
+        .order_by(Node.source_order)
+        .all()
+    )
+    new_nodes = (
+        db.query(Node)
+        .filter(Node.version_id == versions[new_version].id)
+        .order_by(Node.source_order)
+        .all()
+    )
+
+    statuses = compare_nodes(old_nodes, new_nodes)
+    old_by_id = {node.logical_id: node for node in old_nodes}
+    new_by_id = {node.logical_id: node for node in new_nodes}
+
+    # Extract numbers with optional units, such as 15%, 300 mmHg, or 1.5 seconds.
+    number_pattern = re.compile(
+        r"\b\d+(?:\.\d+)?\s*(?:%|mmHg|mm\s*Hg|seconds?|sec|minutes?|min|hours?|h|cycles?)?",
+        re.IGNORECASE,
+    )
+
+    changes = []
+    for logical_id, status in statuses.items():
+        if status == "unchanged":
+            continue
+
+        old_node = old_by_id.get(logical_id)
+        new_node = new_by_id.get(logical_id)
+
+        old_text = (
+            f"{old_node.title} {old_node.body}" if old_node else ""
+        )
+        new_text = (
+            f"{new_node.title} {new_node.body}" if new_node else ""
+        )
+
+        severity = "medium"
+        reason = "Section added or removed."
+
+        if status == "changed":
+            old_numbers = number_pattern.findall(old_text)
+            new_numbers = number_pattern.findall(new_text)
+
+            if old_numbers != new_numbers:
+                severity = "high"
+                reason = "Numeric value or unit may have changed."
+            elif any(
+                term in old_text.lower() or term in new_text.lower()
+                for term in (
+                    "warning", "caution", "overpressure",
+                    "deflate", "must not", "do not",
+                )
+            ):
+                severity = "high"
+                reason = "Potential safety-related text change."
+            else:
+                reason = "Section content changed."
+
+        changes.append({
+            "logical_id": logical_id,
+            "section_number": (
+                new_node.section_number if new_node else old_node.section_number
+            ),
+            "title": new_node.title if new_node else old_node.title,
+            "status": status,
+            "severity": severity,
+            "reason": reason,
+            "old_content_hash": old_node.content_hash if old_node else None,
+            "new_content_hash": new_node.content_hash if new_node else None,
+            "old_text": old_text.strip() or None,
+            "new_text": new_text.strip() or None,
+        })
+
+    return {
+        "document_name": document.name,
+        "old_version": old_version,
+        "new_version": new_version,
+        "change_count": len(changes),
+        "changes": changes,
     }
